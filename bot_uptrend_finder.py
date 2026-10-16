@@ -1,41 +1,64 @@
+import os
 import time
+import requests
+import schedule
+import threading
 import pandas as pd
+from flask import Flask
 from binance.client import Client
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator
 
-# Initialize Binance client (public endpoints)
+# --- FLASK WEB SERVER (Keeps Render Free Web Service Active) ---
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is active and running 24/7!"
+
+# --- SCANNER CONFIGURATION ---
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/YOUR_WEBHOOK_URL_HERE"
+
 client = Client()
 
-TIMEFRAME = Client.KLINE_INTERVAL_4HOUR  # 4-hour candles
+TIMEFRAME = Client.KLINE_INTERVAL_4HOUR
 RSI_MIN = 10
 RSI_MAX = 80
-MIN_VOLUME_USDT = 5_000_000  # Minimum $5M 24h volume
+MIN_VOLUME_USDT = 5_000_000
 
-# List of stablecoins and pegged tokens to skip
 EXCLUDE_TOKENS = [
     'USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'BUSDUSDT', 
     'DAIUSDT', 'UUSDUSDT', 'RLUSDUSDT', 'USDEUSDT', 'USD1USDT'
 ]
 
+def send_discord_alert(matches):
+    if not matches:
+        payload = {"content": "🔍 **Uptrend Scan Completed:** No matching coins found."}
+    else:
+        message = f"🚨 **Uptrend Scanner Alert ({len(matches)} Coins Found)** 🚨\n```\n"
+        message += f"{'Symbol':<12} {'Price ($)':<10} {'RSI':<6}\n" + "-"*32 + "\n"
+        for m in matches:
+            message += f"{m['symbol']:<12} {m['price']:<10} {m['rsi']:<6}\n"
+        message += "```"
+        payload = {"content": message}
+
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json=payload)
+    except Exception as e:
+        print(f"Discord Error: {e}")
+
 def get_binance_usdt_pairs():
-    """Fetch active trading pairs on Binance, filtering out stablecoins."""
     tickers = client.get_ticker()
     valid_pairs = []
-    
     for t in tickers:
         symbol = t['symbol']
         volume = float(t['quoteVolume'])
-        
-        # Keep spot USDT pairs with enough volume, skipping UP/DOWN tokens and stablecoins
         if symbol.endswith('USDT') and not symbol.endswith(('UPUSDT', 'DOWNUSDT')):
             if symbol not in EXCLUDE_TOKENS and volume >= MIN_VOLUME_USDT:
                 valid_pairs.append(symbol)
-                
     return valid_pairs
 
 def check_uptrend(symbol):
-    """Evaluate RSI range and Moving Average alignment."""
     try:
         klines = client.get_klines(symbol=symbol, interval=TIMEFRAME, limit=100)
         df = pd.DataFrame(klines, columns=[
@@ -44,7 +67,6 @@ def check_uptrend(symbol):
         ])
         df['close'] = df['close'].astype(float)
         
-        # Calculate Indicators via 'ta' library
         df['RSI'] = RSIIndicator(close=df['close'], window=14).rsi()
         df['EMA_20'] = EMAIndicator(close=df['close'], window=20).ema_indicator()
         df['EMA_50'] = EMAIndicator(close=df['close'], window=50).ema_indicator()
@@ -55,41 +77,33 @@ def check_uptrend(symbol):
         ema_20 = latest['EMA_20']
         ema_50 = latest['EMA_50']
         
-        # Uptrend Rules:
-        # 1. RSI is between 50 and 60
-        # 2. Price > EMA 20 > EMA 50 (Bullish structure)
         if (RSI_MIN <= rsi <= RSI_MAX) and (close > ema_20 > ema_50):
-            return {
-                'symbol': symbol,
-                'price': close,
-                'rsi': round(rsi, 2),
-                'ema_20': round(ema_20, 4),
-                'ema_50': round(ema_50, 4)
-            }
-            
+            return {'symbol': symbol, 'price': close, 'rsi': round(rsi, 2)}
     except Exception:
         return None
-    
     return None
 
-def main():
-    print("Fetching active USDT crypto pairs on Binance...")
+def run_scan():
+    print("Running scheduled scan...")
     symbols = get_binance_usdt_pairs()
-    print(f"Scanning {len(symbols)} coins on the 4h timeframe...\n")
-    
     matches = []
     for symbol in symbols:
         result = check_uptrend(symbol)
         if result:
             matches.append(result)
-            print(f"Match Found: {result['symbol']} | Price: ${result['price']} | RSI: {result['rsi']}")
         time.sleep(0.05)
-        
-    print("\n" + "="*45)
-    print(f"Scan Complete. Found {len(matches)} uptrend coins:")
-    print("="*45)
-    for m in matches:
-        print(f"Coin: {m['symbol']:<12} Price: ${m['price']:<10} RSI: {m['rsi']}")
+    send_discord_alert(matches)
+
+def run_scheduler():
+    run_scan()
+    schedule.every(4).hours.do(run_scan)
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+# Start background scan thread
+threading.Thread(target=run_scheduler, daemon=True).start()
 
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
